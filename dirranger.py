@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-# dirindex_urls.py — list every entry from open directory-index pages (clean URLs, one per line).
+# dirranger.py — list every entry from directory-listing pages (clean URLs, one per line).
 # Usage:
-#   python3 dirindex_urls.py http://10.129.236.86/vendor/ --depth 8
+#   python3 dirranger.py https://test.com/testing/f1/ --depth 8
+#   python3 dirranger.py https://test.com/testing/ --depth 8
+# Notes:
+#   - Same-origin enforced
+#   - Path-scope enforced (only under the starting path)
+#   - Parses anchors primarily from listing areas (<tbody> or <pre>) to avoid navbar/breadcrumb noise
 
 import argparse, re, sys, urllib.parse as up, requests
 from html.parser import HTMLParser
 from collections import deque
 from requests.adapters import HTTPAdapter
+
 try:
-    # urllib3>=1.26 / 2.x
     from urllib3.util.retry import Retry
 except Exception:  # pragma: no cover
-    Retry = None  # retries will be skipped if urllib3 isn't available
+    Retry = None
 
 
 # ----------------------------
@@ -20,58 +25,62 @@ except Exception:  # pragma: no cover
 
 class AnchorParser(HTMLParser):
     """
-    Capture anchors from common autoindex layouts:
-      - Apache (table)
-      - nginx/lighttpd/dufs (pre)
-      - generic <a> fallback
+    Capture anchors mainly from common directory listing regions:
+      - Apache/nginx/lighttpd/dufs style: <pre> listings
+      - Custom table UIs: <tbody> rows (like download.owncloud.com)
+    Fallback: if nothing found in tbody/pre, return all anchors.
     """
     def __init__(self):
         super().__init__()
-        self.links = []
-        self._in_table = False
         self._in_pre = False
+        self._in_tbody = False
+        self._all = []
+        self._strict = []
 
     def handle_starttag(self, tag, attrs):
         t = tag.lower()
-        if t == "table":
-            self._in_table = True
-        elif t == "pre":
+        if t == "pre":
             self._in_pre = True
-        if t == "a":  # accept anchors in table/pre or anywhere as a fallback
+        elif t == "tbody":
+            self._in_tbody = True
+
+        if t == "a":
             href = dict(attrs).get("href")
-            if href:
-                self.links.append(href.strip())
+            if not href:
+                return
+            href = href.strip()
+            self._all.append(href)
+            if self._in_pre or self._in_tbody:
+                self._strict.append(href)
 
     def handle_endtag(self, tag):
         t = tag.lower()
-        if t == "table":
-            self._in_table = False
-        elif t == "pre":
+        if t == "pre":
             self._in_pre = False
+        elif t == "tbody":
+            self._in_tbody = False
+
+    @property
+    def links(self):
+        return self._strict if self._strict else self._all
 
 
 # ----------------------------
 # Helpers
 # ----------------------------
 
-def is_index_of(html: str) -> bool:
-    """Heuristics for autoindex pages."""
-    return bool(
-        re.search(r"<title>\s*Index of\b", html, re.I) or
-        re.search(r"<h\d[^>]*>\s*Index of\b", html, re.I) or
-        re.search(r"<th[^>]*>\s*Name\s*</th>", html, re.I) or
-        # nginx-style: a <pre> with a header row including Name / Last modified
-        re.search(r"<pre>.*?\bName\s+Last\s+modified\b", html, re.I | re.S)
-    )
-
 def normalize(u: str) -> str:
     p = up.urlsplit(u)
-    # keep query for files, drop fragment; ensure path has single slashes
     path = re.sub(r"(?<!:)//+", "/", p.path or "/")
     return up.urlunsplit((p.scheme, p.netloc, path, p.query, ""))
 
-def ensure_dir(u: str) -> str:
-    return u if u.endswith("/") else u + "/"
+def normalize_dir(u: str) -> str:
+    """Canonical directory URL: trailing slash, no query/fragment."""
+    p = up.urlsplit(u)
+    path = re.sub(r"(?<!:)//+", "/", p.path or "/")
+    if not path.endswith("/"):
+        path += "/"
+    return up.urlunsplit((p.scheme, p.netloc, path, "", ""))
 
 def resolve(base: str, href: str) -> str:
     return normalize(up.urljoin(base, href))
@@ -81,19 +90,54 @@ def _host_port(u: str):
     host = (p.hostname or "").lower()
     port = p.port
     if port is None:
-        if p.scheme == "http":
-            port = 80
-        elif p.scheme == "https":
-            port = 443
+        port = 80 if p.scheme == "http" else 443 if p.scheme == "https" else None
     return host, port
 
 def same_origin(u: str, base_url: str) -> bool:
-    """Compare host + effective port (handles example.com vs example.com:80)."""
     return _host_port(u) == _host_port(base_url)
 
+def _norm_path(path: str) -> str:
+    if not path:
+        return "/"
+    path = re.sub(r"//+", "/", path)
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
+
+def within_start_path(u: str, start_path_prefix: str) -> bool:
+    p = up.urlsplit(u)
+    path = _norm_path(p.path)
+    return path.startswith(start_path_prefix)
+
 def parent_of(url: str) -> str:
-    # canonical parent directory URL (with trailing /)
-    return ensure_dir(normalize(up.urljoin(url, "../")))
+    return normalize_dir(up.urljoin(url, "../"))
+
+def looks_like_index(html: str) -> bool:
+    """
+    Heuristics for directory-listing pages:
+      - Apache "Index of"
+      - nginx/lighttpd/dufs style
+      - custom table UIs with Name/Size/Modified columns
+    """
+    h = html
+
+    if re.search(r"<title>\s*Index of\b", h, re.I):
+        return True
+    if re.search(r"<h\d[^>]*>\s*Index of\b", h, re.I):
+        return True
+    if re.search(r"<pre>.*?\bName\s+Last\s+modified\b", h, re.I | re.S):
+        return True
+    if re.search(r"<th[^>]*>\s*Name\s*</th>", h, re.I):
+        return True
+
+    if re.search(r"<table\b", h, re.I):
+        has_name = bool(re.search(r"<th[^>]*>.*?\bName\b", h, re.I | re.S))
+        has_size = bool(re.search(r"<th[^>]*>.*?\bSize\b", h, re.I | re.S))
+        has_modified = bool(re.search(r"<th[^>]*>.*?\bModified\b", h, re.I | re.S))
+        if has_name and (has_size or has_modified):
+            return True
+
+    return False
 
 
 # ----------------------------
@@ -102,9 +146,8 @@ def parent_of(url: str) -> str:
 
 def crawl(start_url: str, depth: int, timeout: float, quiet: bool, no_dedupe: bool):
     sess = requests.Session()
-    sess.headers.update({"User-Agent": "dirindex-urls/1.1"})
+    sess.headers.update({"User-Agent": "dirranger/1.4"})
 
-    # Optional retry policy for transient errors
     if Retry is not None:
         retry = Retry(
             total=2,
@@ -116,15 +159,25 @@ def crawl(start_url: str, depth: int, timeout: float, quiet: bool, no_dedupe: bo
         sess.mount("http://", adapter)
         sess.mount("https://", adapter)
 
-    start_url = ensure_dir(normalize(start_url))
-    base_origin = start_url  # keep full URL for origin compare
+    start_url = normalize_dir(start_url)
+    base_origin = start_url
+
+    # Path-scope prefix: always a directory path ending with "/"
+    start_path_prefix = _norm_path(up.urlsplit(start_url).path)
+    if not start_path_prefix.endswith("/"):
+        start_path_prefix += "/"
 
     q = deque([(start_url, 0)])
-    visited_dirs = set()     # directory-index pages we already parsed
-    printed = set()          # URLs already printed (avoid duplicates)
+    visited_dirs = set()
+
+    printed = None if no_dedupe else set()
 
     def say(u: str):
-        if no_dedupe or u not in printed:
+        nonlocal printed
+        if printed is None:
+            print(u, flush=True)
+            return
+        if u not in printed:
             print(u, flush=True)
             printed.add(u)
 
@@ -132,69 +185,97 @@ def crawl(start_url: str, depth: int, timeout: float, quiet: bool, no_dedupe: bo
         if not quiet:
             print(msg, file=sys.stderr, flush=True)
 
+    def in_scope(u: str) -> bool:
+        if not same_origin(u, base_origin):
+            return False
+        if not within_start_path(u, start_path_prefix):
+            return False
+        return True
+
     while q:
         url, d = q.popleft()
+        url = normalize_dir(url)
+
         if url in visited_dirs or d > depth:
             continue
+
+        # Enforce scope for queued URLs
+        if not in_scope(url):
+            continue
+
         visited_dirs.add(url)
 
         try:
             r = sess.get(url, timeout=timeout, allow_redirects=True)
             r.raise_for_status()
             r.encoding = r.encoding or "utf-8"
-            html = r.text
-            base = normalize(r.url)
-            if not base.endswith("/"):
-                # landed on a file, not an index page
-                say(base)
+
+            final_url = normalize(r.url)
+
+            # Enforce scope AFTER redirects
+            if not in_scope(final_url):
                 continue
+
+            # Landed on a file
+            if not final_url.endswith("/"):
+                say(final_url)
+                continue
+
+            # Only parse HTML-ish content
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if ctype and ("text/html" not in ctype and "application/xhtml+xml" not in ctype):
+                continue
+
+            html = r.text
+            base = normalize_dir(final_url)
+
         except requests.RequestException as e:
             log(f"[warn] {url} -> {e.__class__.__name__}: {e}")
             continue
-        except Exception as e:  # unlikely, keep crawler resilient
+        except Exception as e:
             log(f"[warn] {url} -> {e.__class__.__name__}")
             continue
 
-        if not is_index_of(html):
-            # not an autoindex page — stop recursion from here
-            continue
-
-        # parent directory (absolute) to skip cycles
-        parent_abs = parent_of(base)
-
-        # parse links in the index
         parser = AnchorParser()
         parser.feed(html)
 
+        if not looks_like_index(html):
+            continue
+
+        parent_abs = parent_of(base)
+
         for href in parser.links:
-            # ignore obvious parent markers and sort links
+            if not href:
+                continue
+
+            # ignore query/fragment-only links (sort controls, anchors)
             if href.startswith("?") or href.startswith("#"):
                 continue
-            # resolve to absolute
+
             child = resolve(base, href)
 
-            # obey same-origin scope (avoid redirecting off-site silently)
-            if not same_origin(child, base_origin):
-                log(f"[skip] out-of-scope: {child}")
+            # avoid self/parent cycles
+            if normalize_dir(child) == base or normalize_dir(child) == parent_abs:
                 continue
 
-            # skip explicit parent/self to prevent vendor <-> composer ping-pong
-            if child == base or child == parent_abs:
+            # scope enforcement (origin + path prefix)
+            if not in_scope(child):
                 continue
 
             if child.endswith("/"):
-                # directory entry (index page)
-                say(child)                      # print directory URL
-                if child not in visited_dirs and d + 1 <= depth:
-                    q.append((child, d + 1))
+                child_dir = normalize_dir(child)  # drops query
+                if not in_scope(child_dir):
+                    continue
+                say(child_dir)
+                if child_dir not in visited_dirs and d + 1 <= depth:
+                    q.append((child_dir, d + 1))
             else:
-                # file entry
-                say(child)
+                say(normalize(child))
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Print ALL URLs from open directory indexes (clean, one per line).")
-    ap.add_argument("url", help="Starting directory URL (e.g., http://host/vendor/)")
+    ap = argparse.ArgumentParser(description="Print ALL URLs from directory listings (clean, one per line).")
+    ap.add_argument("url", help="Starting directory URL (e.g., https://test.com/testing/)")
     ap.add_argument("--depth", type=int, default=8, help="Max recursion depth (default: 8)")
     ap.add_argument("--timeout", type=float, default=8.0, help="HTTP timeout seconds (default: 8.0)")
     ap.add_argument("--quiet", action="store_true", help="Suppress warnings/debug to stderr")
