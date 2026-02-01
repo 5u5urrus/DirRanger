@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # dirranger.py — list every entry from directory-listing pages (clean URLs, one per line).
+# Author: Vahe Demirkhanyan
 # Usage:
 #   python3 dirranger.py https://test.com/testing/f1/ --depth 8
 #   python3 dirranger.py https://test.com/testing/ --depth 8
